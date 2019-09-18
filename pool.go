@@ -3,7 +3,9 @@ package rethinkdb
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"sync"
 
 	"golang.org/x/net/context"
@@ -23,6 +25,7 @@ type Pool struct {
 
 	mu     sync.RWMutex // protects following fields
 	closed bool
+	logger *log.Logger
 }
 
 // NewPool creates a new connection pool for the given host
@@ -52,9 +55,10 @@ func NewPool(host Host, opts *ConnectOpts) (*Pool, error) {
 	}
 
 	return &Pool{
-		pool: p,
-		host: host,
-		opts: opts,
+		pool:   p,
+		host:   host,
+		opts:   opts,
+		logger: log.New(os.Stderr, "rethinkdb-go", 0),
 	}, nil
 }
 
@@ -92,24 +96,41 @@ func (p *Pool) conn() (*Connection, *pool.PoolConn, error) {
 		return nil, nil, errPoolClosed
 	}
 
-	nc, err := p.pool.Get()
-	if err != nil {
-		return nil, nil, err
+	// we try up to one more than the max pool size; if all the pool conns are bad then the pool will try to make
+	// one new connection
+	maxLoop := p.opts.MaxOpen + 1
+
+	for i := 0; i < maxLoop; i++ {
+		nc, err := p.pool.Get()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		pc, ok := nc.(*pool.PoolConn)
+		if !ok {
+			// This should never happen!
+			return nil, nil, fmt.Errorf("Invalid connection in pool")
+		}
+
+		conn, ok := pc.Conn.(*Connection)
+		if !ok {
+			// This should never happen!
+			return nil, nil, fmt.Errorf("Invalid connection in pool")
+		}
+
+		if conn.isBad() {
+			p.logger.Printf("rethink pool: get connection: found bad conn on iteration %d", i)
+			pc.MarkUnusable()
+			err = conn.Close()
+			if nil != err {
+				p.logger.Printf("rethink pool: get connection: error closing bad conn: %s", err)
+			}
+		} else {
+			return conn, pc, nil
+		}
 	}
 
-	pc, ok := nc.(*pool.PoolConn)
-	if !ok {
-		// This should never happen!
-		return nil, nil, fmt.Errorf("Invalid connection in pool")
-	}
-
-	conn, ok := pc.Conn.(*Connection)
-	if !ok {
-		// This should never happen!
-		return nil, nil, fmt.Errorf("Invalid connection in pool")
-	}
-
-	return conn, pc, nil
+	return nil, nil, fmt.Errorf("rethink pool: get connection: could not get a good connection")
 }
 
 // SetInitialPoolCap sets the initial capacity of the connection pool.
